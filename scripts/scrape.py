@@ -1,8 +1,11 @@
-"""Scrape https://raider.io/weekly-routes and write raiderio_weekly.json.
+"""Scrape the latest raider.io weekly-routes post and resolve every
+embedded keystone.guru route into an MDT import string, then write
+raiderio_weekly.json.
 
-The post HTML is the source of truth for what routes exist; see the
-CUSTOMIZE block below for the selectors / parsing logic you need to
-maintain when raider.io ships a redesign.
+raider.io is a JS-rendered SPA, so we hit the JSON endpoint that powers
+it (/api/news/weekly-routes) rather than parsing rendered HTML. Each
+weekly post embeds keystone.guru routes via <iframe src="...">, and
+keystone.guru exposes an MDT export at /ajax/{publicKey}/mdtExport.
 
 Exit code 0 = wrote JSON, 1 = aborted (zero routes extracted -- preserve
 the previous good file rather than overwriting with empty).
@@ -12,27 +15,42 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup
 
-SOURCE_URL = "https://raider.io/weekly-routes"
+RIO_API_URL = "https://raider.io/api/news/weekly-routes"
+KG_EXPORT_URL = "https://keystone.guru/ajax/{public_key}/mdtExport"
+KG_ROUTE_URL = "https://keystone.guru/{public_key}"
+
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "raiderio_weekly.json"
 
-# Maintained by hand to mirror MAPPING_REGISTRY in the plugin's main.lua.
-# Add an entry here when a new dungeon appears in MAPPING_REGISTRY.
-DUNGEON_NAME_TO_INSTANCE_ID = {
-    "Algeth'ar Academy":       2526,
-    "Magister's Terrace":      2811,
-    "Maisara Caverns":         2874,
-    "Nexus Point Xenas":       2915,
-    "Pit of Saron":            658,
-    "Seat of the Triumvirate": 1753,
-    "Skyreach":                1209,
-    "Windrunner Spire":        2805,
+# The raider.io weekly post uses <div id="{anchor}"></div> to delimit each
+# dungeon section. Maintain this table when a new dungeon is added to the
+# plugin's MAPPING_REGISTRY in main.lua.
+ANCHOR_TO_INSTANCE_ID = {
+    "algethar_academy":        2526,
+    "magisters_terrace":       2811,
+    "maisara_caverns":         2874,
+    "nexus_point_xenas":       2915,
+    "pit_of_saron":            658,
+    "seat_of_the_triumvirate": 1753,
+    "skyreach":                1209,
+    "windrunner_spire":        2805,
+}
+
+ANCHOR_TO_DISPLAY_NAME = {
+    "algethar_academy":        "Algeth'ar Academy",
+    "magisters_terrace":       "Magister's Terrace",
+    "maisara_caverns":         "Maisara Caverns",
+    "nexus_point_xenas":       "Nexus-Point Xenas",
+    "pit_of_saron":            "Pit of Saron",
+    "seat_of_the_triumvirate": "Seat of the Triumvirate",
+    "skyreach":                "Skyreach",
+    "windrunner_spire":        "Windrunner Spire",
 }
 
 USER_AGENT = (
@@ -40,111 +58,148 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
+ANCHOR_OR_IFRAME = re.compile(
+    r'<div id="(?P<anchor>[a-z_]+)"></div>'
+    r'|keystone\.guru/(?P<route>[A-Za-z0-9]+)/embed'
+)
 
-def fetch_html(url: str) -> str:
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
-    response.raise_for_status()
-    return response.text
-
-
-def parse_post(html: str) -> dict[str, Any]:
-    """Pick the latest weekly-routes post out of the listing page and
-    return its parsed payload.
-
-    CUSTOMIZE: inspect https://raider.io/weekly-routes manually, then
-    update the selectors below to match the real DOM. The fields the
-    rest of this script expects:
-        post_url: str
-        post_title: str
-        week_label: str   (e.g. "Week of May 25")
-        routes: dict[str, list[dict]]   keyed by dungeon display name,
-            each entry: {"name": str, "mdt_string": str,
-                         "author": str|None, "score": float|None}
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # CUSTOMIZE START -----------------------------------------------------
-    # Example skeleton; replace selectors with whatever raider.io ships.
-    post_link = soup.select_one("a.weekly-routes-post-link")
-    if post_link is None:
-        raise RuntimeError("No weekly-routes post link found on the index page.")
-    post_url = post_link.get("href", "")
-    if post_url.startswith("/"):
-        post_url = "https://raider.io" + post_url
-
-    post_html = fetch_html(post_url)
-    post_soup = BeautifulSoup(post_html, "html.parser")
-
-    post_title = (post_soup.title.string or "").strip() if post_soup.title else ""
-
-    # Try to pull a week label from the title; fall back to today.
-    m = re.search(r"Week of ([A-Za-z]+ \d+)", post_title)
-    week_label = m.group(1) if m else datetime.now(timezone.utc).strftime("Week of %B %d")
-
-    # Each dungeon section: expect a heading with the dungeon name and a
-    # `<code>` block (or similar) containing the MDT string starting with `!`.
-    routes_by_dungeon: dict[str, list[dict[str, Any]]] = {}
-    for section in post_soup.select("section.dungeon-route"):
-        name_el = section.select_one(".dungeon-name")
-        code_el = section.select_one("code.mdt-string, pre.mdt-string")
-        if name_el is None or code_el is None:
-            continue
-        dungeon_name = name_el.get_text(strip=True)
-        mdt_string = code_el.get_text(strip=True)
-        if not mdt_string.startswith("!"):
-            continue
-        author_el = section.select_one(".route-author")
-        score_el = section.select_one(".route-score")
-        routes_by_dungeon.setdefault(dungeon_name, []).append({
-            "name": dungeon_name + " - " + week_label,
-            "mdt_string": mdt_string,
-            "author": author_el.get_text(strip=True) if author_el else None,
-            "score": float(score_el.get_text(strip=True)) if score_el else None,
-        })
-    # CUSTOMIZE END -------------------------------------------------------
-
-    return {
-        "post_url": post_url,
-        "post_title": post_title,
-        "week_label": week_label,
-        "routes_by_dungeon_name": routes_by_dungeon,
-    }
+WEEK_LABEL_RE = re.compile(r"Week\s+\d+", re.IGNORECASE)
 
 
-def remap_to_instance_ids(routes_by_name: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
-    """Convert dungeon-name keyed entries to instance-id-string keyed
-    entries, dropping any dungeon name that isn't in the mapping table
-    (logging a warning)."""
-    out: dict[str, list[dict[str, Any]]] = {}
-    for name, entries in routes_by_name.items():
-        inst_id = DUNGEON_NAME_TO_INSTANCE_ID.get(name)
-        if inst_id is None:
-            print(f"WARN: dungeon name not in mapping table, skipping: {name!r}", file=sys.stderr)
-            continue
-        out[str(inst_id)] = entries
-    return out
+def fetch_latest_article(session: requests.Session) -> dict[str, Any]:
+    """Return the latest weekly-routes article from raider.io's JSON API."""
+    r = session.get(RIO_API_URL, timeout=30, headers={"User-Agent": USER_AGENT})
+    r.raise_for_status()
+    payload = r.json()
+    articles = payload.get("articles") or []
+    if not articles:
+        raise RuntimeError("raider.io returned zero articles from /api/news/weekly-routes")
+    # Articles are ordered newest-first; take the first one that looks like
+    # a weekly-route post.
+    for art in articles:
+        title = (art.get("title") or "")
+        if "Weekly Route" in title:
+            return art
+    return articles[0]
+
+
+def extract_dungeon_routes(content_html: str) -> list[tuple[str, str]]:
+    """Walk the article body in document order, associating each
+    keystone.guru iframe with the dungeon anchor that most recently
+    preceded it.
+
+    Returns a list of (anchor_id, kg_public_key) pairs."""
+    pairs: list[tuple[str, str]] = []
+    current_anchor: str | None = None
+    for m in ANCHOR_OR_IFRAME.finditer(content_html):
+        anchor = m.group("anchor")
+        route = m.group("route")
+        if anchor is not None:
+            current_anchor = anchor if anchor in ANCHOR_TO_INSTANCE_ID else None
+        elif route is not None and current_anchor is not None:
+            pairs.append((current_anchor, route))
+    return pairs
+
+
+def fetch_mdt_string(session: requests.Session, public_key: str) -> str:
+    """Call keystone.guru's MDT-export AJAX endpoint. Returns the raw
+    MDT import string (starts with '!')."""
+    url = KG_EXPORT_URL.format(public_key=public_key)
+    r = session.get(
+        url,
+        timeout=30,
+        headers={
+            "User-Agent": USER_AGENT,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": KG_ROUTE_URL.format(public_key=public_key),
+        },
+        params={"useCache": "true"},
+    )
+    r.raise_for_status()
+    body = r.json()
+    mdt = body.get("mdt_string")
+    if not isinstance(mdt, str) or not mdt.startswith("!"):
+        raise RuntimeError(f"keystone.guru returned no mdt_string for {public_key!r}: {body!r}")
+    return mdt
+
+
+def derive_week_label(article: dict[str, Any]) -> str:
+    """Pull a 'Week N' label out of the article body if present; fall
+    back to the published date."""
+    body = article.get("contentHtml") or ""
+    m = WEEK_LABEL_RE.search(body)
+    if m:
+        return m.group(0)
+    pub = article.get("published_at") or ""
+    if pub:
+        try:
+            dt = datetime.strptime(pub[:10], "%Y-%m-%d")
+            return dt.strftime("Week of %B %d")
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).strftime("Week of %B %d")
 
 
 def main() -> int:
-    html = fetch_html(SOURCE_URL)
-    parsed = parse_post(html)
-    routes = remap_to_instance_ids(parsed["routes_by_dungeon_name"])
+    session = requests.Session()
 
-    total = sum(len(v) for v in routes.values())
+    article = fetch_latest_article(session)
+    pairs = extract_dungeon_routes(article.get("contentHtml") or "")
+    if not pairs:
+        print(
+            "ABORT: no (dungeon, route) pairs extracted from latest article; "
+            "raider.io article structure may have changed.",
+            file=sys.stderr,
+        )
+        return 1
+
+    week_label = derive_week_label(article)
+    routes_by_instance: dict[str, list[dict[str, Any]]] = {}
+
+    for anchor, public_key in pairs:
+        inst_id = ANCHOR_TO_INSTANCE_ID[anchor]
+        display = ANCHOR_TO_DISPLAY_NAME[anchor]
+        try:
+            mdt_string = fetch_mdt_string(session, public_key)
+        except Exception as exc:
+            print(
+                f"WARN: failed to fetch MDT export for {anchor} / {public_key}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+        routes_by_instance.setdefault(str(inst_id), []).append({
+            "name": f"{display} - {week_label}",
+            "mdt_string": mdt_string,
+            "author": "Raider.IO",
+            "score": None,
+            "kg_public_key": public_key,
+            "kg_url": KG_ROUTE_URL.format(public_key=public_key),
+        })
+        # gentle rate limit
+        time.sleep(0.5)
+
+    total = sum(len(v) for v in routes_by_instance.values())
     if total == 0:
-        print("ABORT: zero routes extracted; refusing to overwrite raiderio_weekly.json", file=sys.stderr)
+        print(
+            "ABORT: zero routes extracted; refusing to overwrite raiderio_weekly.json",
+            file=sys.stderr,
+        )
         return 1
 
     payload = {
-        "post_url": parsed["post_url"],
-        "post_title": parsed["post_title"],
+        "post_url": article.get("url") or "https://raider.io/weekly-routes",
+        "post_title": article.get("title") or "",
         "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "season": "",  # populate if you parse it from the post
-        "week_label": parsed["week_label"],
-        "routes": routes,
+        "season": "",
+        "week_label": week_label,
+        "routes": routes_by_instance,
     }
     OUTPUT_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    print(f"Wrote {OUTPUT_PATH} with {total} route(s) across {len(routes)} dungeon(s).")
+    print(
+        f"Wrote {OUTPUT_PATH} with {total} route(s) across "
+        f"{len(routes_by_instance)} dungeon(s)."
+    )
     return 0
 
 
